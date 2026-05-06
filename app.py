@@ -8,10 +8,13 @@ import google.generativeai as genai
 
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from langdetect import detect
-from googletrans import Translator
+from deep_translator import GoogleTranslator
 from functools import lru_cache
 import re
 import numpy as np
+from PIL import Image
+import base64
+import anthropic
 
 # -------------------------
 # Configurable Category Profiles
@@ -40,6 +43,23 @@ CATEGORY_PROFILES = {
             'features': 'Features',
             'design': 'Design & Look',
             'charging': 'Charging/Battery'
+        },
+        'aspect_keywords': {
+            'delivery': ['delivery', 'shipping', 'courier', 'dispatched', 'arrived', 'arrival'],
+            'service': ['service', 'customer care', 'helpdesk', 'representative', 'agent', 'staff'],
+            'price': ['price', 'cost', 'expensive', 'cheap', 'affordable', 'value', 'worth', 'overpriced', 'budget'],
+            'quality': ['quality', 'build quality', 'sturdy', 'flimsy', 'premium', 'cheap feel'],
+            'packaging': ['packaging', 'package', 'box', 'wrapped', 'packing', 'packed'],
+            'usability': ['usability', 'easy to use', 'user friendly', 'intuitive', 'simple', 'complicated', 'difficult to use'],
+            'performance': ['performance', 'speed', 'fast', 'slow', 'lag', 'smooth', 'efficient', 'powerful', 'sluggish'],
+            'warranty': ['warranty', 'guarantee', 'repair', 'service center'],
+            'return_policy': ['return', 'refund', 'exchange', 'replacement', 'return policy'],
+            'durability': ['durability', 'durable', 'lasting', 'broke', 'broken', 'fragile', 'long lasting', 'wear and tear'],
+            'availability': ['availability', 'stock', 'out of stock', 'available', 'in stock'],
+            'support': ['support', 'technical support', 'helpline', 'assistance', 'tech support'],
+            'features': ['feature', 'features', 'function', 'capability', 'specs', 'specification', 'functionality'],
+            'design': ['design', 'look', 'appearance', 'aesthetic', 'style', 'sleek', 'slim', 'bulky'],
+            'charging': ['charging', 'battery', 'charge', 'drain', 'drains', 'power', 'battery life', 'fast charging', 'mah'],
         }
     },
     'Fashion': {
@@ -65,6 +85,24 @@ CATEGORY_PROFILES = {
             'size': 'Size Accuracy',
             'washing': 'Washing/Care',
             'durability': 'Durability'
+        },
+        'aspect_keywords': {
+            'delivery': ['delivery', 'shipping', 'courier', 'dispatched', 'arrived'],
+            'service': ['service', 'customer care', 'helpdesk', 'agent', 'staff'],
+            'price': ['price', 'cost', 'expensive', 'cheap', 'affordable', 'value', 'worth', 'overpriced'],
+            'quality': ['quality', 'fabric quality', 'well made', 'poorly made'],
+            'packaging': ['packaging', 'package', 'box', 'wrapped', 'packing'],
+            'availability': ['availability', 'stock', 'out of stock', 'available'],
+            'return_policy': ['return', 'refund', 'exchange', 'replacement'],
+            'design': ['design', 'style', 'pattern', 'look', 'appearance', 'aesthetic', 'print'],
+            'comfort': ['comfort', 'comfortable', 'cozy', 'soft', 'rough', 'itchy', 'scratchy'],
+            'fit': ['fit', 'fitting', 'tight', 'loose', 'baggy', 'slim fit', 'oversized'],
+            'material': ['material', 'fabric', 'cloth', 'texture', 'feel', 'cotton', 'polyester', 'silk', 'wool'],
+            'color': ['color', 'colour', 'shade', 'fade', 'faded', 'bright', 'dark', 'vibrant'],
+            'stitching': ['stitching', 'stitch', 'seam', 'thread', 'sewing', 'stitched'],
+            'size': ['size', 'sizing', 'dimension', 'measurement', 'runs small', 'runs large', 'true to size'],
+            'washing': ['washing', 'wash', 'laundry', 'shrink', 'shrank', 'care', 'fading after wash'],
+            'durability': ['durability', 'durable', 'lasting', 'wear', 'tear', 'long lasting', 'pilling'],
         }
     }
 }
@@ -99,6 +137,16 @@ def _compile_rules(rules_dict):
         compiled[tag] = [re.compile(p, flags=re.IGNORECASE) for p in patterns]
     return compiled
 
+def _aspect_pattern(aspect, profile):
+    """Return a regex pattern matching any keyword for this aspect."""
+    keywords = profile.get('aspect_keywords', {}).get(aspect, [aspect])
+    return '|'.join(re.escape(kw) for kw in keywords)
+
+def _aspect_in_text(text, aspect, profile):
+    keywords = profile.get('aspect_keywords', {}).get(aspect, [aspect])
+    t = str(text).lower()
+    return any(kw in t for kw in keywords)
+
 def detect_tags_from_text(text, compiled_rules):
     text = str(text)
     detected = []
@@ -109,7 +157,6 @@ def detect_tags_from_text(text, compiled_rules):
 
 # Initialize analyzers
 analyzer = SentimentIntensityAnalyzer()
-translator = Translator()
 aspects = CATEGORY_PROFILES['Electronics']['aspects']
 aspect_display = CATEGORY_PROFILES['Electronics']['aspect_display']
 
@@ -124,7 +171,7 @@ def cached_translate_to_english(text):
         if lang == 'en':
             return text
         else:
-            return translator.translate(text, src=lang, dest='en').text
+            return GoogleTranslator(source=lang, target='en').translate(text)
     except Exception:
         return text
 
@@ -165,6 +212,13 @@ def convert_df(df):
 # -------------------------
 # Gemini Helpers
 # -------------------------
+def _get_anthropic_api_key():
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY", None)  # type: ignore[attr-defined]
+    except Exception:
+        key = None
+    return key or os.environ.get("ANTHROPIC_API_KEY")
+
 def _get_gemini_api_key():
     try:
         # Prefer Streamlit secrets if available
@@ -286,17 +340,12 @@ with st.expander('🔍 Single Text Analysis'):
         intent_rules = _compile_rules(profile.get('intent_rules', INTENT_RULES_DEFAULT))
         emotion_rules = _compile_rules(profile.get('emotion_rules', EMOTION_RULES_DEFAULT))
 
-        aspect_mentions = {aspect_display.get(aspect, aspect.title()): (aspect in english_text.lower()) for aspect in aspects}
+        aspect_mentions = [aspect_display.get(aspect, aspect.title()) for aspect in aspects if _aspect_in_text(english_text, aspect, profile)]
         intents = detect_tags_from_text(english_text, intent_rules)
         emotions = detect_tags_from_text(english_text, emotion_rules)
-        st.write('🔎 Aspect Mentions:', aspect_mentions)
+        st.write('🔎 Aspect Mentions:', aspect_mentions or ['none'])
         st.write('🎯 Intents:', intents or ['none'])
         st.write('💬 Emotions:', emotions or ['none'])
-
-    pre = st.text_input('Clean the text:')
-    if pre:
-        cleaned = simple_clean(pre)
-        st.write('🧼 Cleaned Text:', cleaned)
 
 # -------------------------
 # 2. File Upload
@@ -345,7 +394,8 @@ if uploaded_file:
         # Aspect extraction
         for aspect in aspects:
             col_name = aspect + '_mention'
-            df[col_name] = df['Review_Summary_English'].str.lower().str.contains(aspect)
+            pattern = _aspect_pattern(aspect, profile)
+            df[col_name] = df['Review_Summary_English'].str.lower().str.contains(pattern, regex=True, na=False)
 
         # Intent & Emotion tagging
         intent_rules = _compile_rules(profile.get('intent_rules', INTENT_RULES_DEFAULT))
@@ -397,6 +447,31 @@ if uploaded_file:
                 ax.axis('equal')
                 st.pyplot(fig)
       
+        # -------------------------
+        # Word Cloud
+        # -------------------------
+        st.subheader("☁️ Word Cloud")
+        wc_sentiment_filter = st.selectbox(
+            "Generate word cloud for:", ["All Reviews", "Positive", "Negative", "Neutral"], key="wc_filter"
+        )
+        if wc_sentiment_filter == "All Reviews":
+            wc_text_series = df['Review_Summary_English']
+        else:
+            wc_text_series = df[df['final_sentiment'] == wc_sentiment_filter]['Review_Summary_English']
+
+        wc_text = " ".join(wc_text_series.dropna().astype(str).tolist())
+        wc_text_clean = simple_clean(wc_text)
+
+        if wc_text_clean.strip():
+            wc = WordCloud(width=900, height=350, background_color='white', colormap='viridis',
+                           max_words=150, collocations=False).generate(wc_text_clean)
+            fig_wc, ax_wc = plt.subplots(figsize=(12, 4))
+            ax_wc.imshow(wc, interpolation='bilinear')
+            ax_wc.axis('off')
+            st.pyplot(fig_wc)
+        else:
+            st.info("Not enough text to generate a word cloud for this filter.")
+
         # -------------------------
         # Intent & Emotion Summaries
         # -------------------------
@@ -513,3 +588,200 @@ if uploaded_file:
         # -------------------------
         with st.expander("🗂 Show All Reviews"):
             st.dataframe(df)
+
+# -------------------------
+# Platform Comparison
+# -------------------------
+st.markdown("---")
+st.subheader("🆚 Platform Comparison")
+st.caption("Compare sentiment across any two platforms. Supports CSV upload, pasted text, or review screenshots.")
+
+# --- Helpers ---
+def _process_platform_df(df_p, prof):
+    df_p = df_p.copy()
+    if 'Review_Summary' not in df_p.columns or 'Rating' not in df_p.columns:
+        return None, "Data must have 'Review_Summary' and 'Rating' columns."
+    df_p['Rating'] = pd.to_numeric(df_p['Rating'], errors='coerce')
+    df_p = df_p.dropna(subset=['Rating'])
+    df_p['Review_Summary_English'] = df_p['Review_Summary'].astype(str)
+    df_p['score'] = df_p['Review_Summary_English'].apply(get_vader_sentiment_score)
+    df_p['text_sentiment'] = df_p['score'].apply(analyze_vader_sentiment)
+    df_p['final_sentiment'] = df_p.apply(final_sentiment, axis=1)
+    for asp in prof['aspects']:
+        pattern = _aspect_pattern(asp, prof)
+        df_p[asp + '_mention'] = df_p['Review_Summary_English'].str.lower().str.contains(pattern, regex=True, na=False)
+    return df_p, None
+
+def _text_to_df(text):
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    if not lines:
+        return None, "No reviews found in pasted text."
+    return pd.DataFrame({'Review_Summary': lines, 'Rating': 3}), None
+
+def _images_to_df(image_files):
+    api_key = _get_anthropic_api_key()
+    if not api_key:
+        return None, "ANTHROPIC_API_KEY not found — required for image extraction."
+    client = anthropic.Anthropic(api_key=api_key, base_url="https://api.anthropic.com")
+    media_map = {'jpeg': 'image/jpeg', 'jpg': 'image/jpeg', 'png': 'image/png',
+                 'webp': 'image/webp', 'gif': 'image/gif'}
+    all_reviews = []
+    for img_file in image_files:
+        img_bytes = img_file.read()
+        img_file.seek(0)
+        img = Image.open(img_file)
+        fmt = (img.format or 'PNG').lower()
+        media_type = media_map.get(fmt, 'image/png')
+        img_b64 = base64.standard_b64encode(img_bytes).decode('utf-8')
+        try:
+            response = client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=1024,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
+                    {"type": "text", "text": (
+                        "Extract all customer review text visible in this image. "
+                        "Return each review on a separate new line. "
+                        "Only return the review text itself — no star ratings, dates, usernames, or labels."
+                    )}
+                ]}]
+            )
+            lines = [l.strip() for l in response.content[0].text.strip().splitlines() if l.strip()]
+            all_reviews.extend(lines)
+        except Exception as e:
+            err_str = str(e)
+            if "credit balance is too low" in err_str or "402" in err_str:
+                return None, "Image extraction requires Anthropic API credits. Please use CSV or Text input instead."
+            return None, f"Image extraction failed: {e}"
+    if not all_reviews:
+        return None, "No review text could be extracted from the uploaded image(s)."
+    return pd.DataFrame({'Review_Summary': all_reviews, 'Rating': 3}), None
+
+def _resolve_platform_input(csv_file, text, imgs):
+    if csv_file:
+        df = pd.read_csv(csv_file)
+        return df.drop(columns=['Unnamed: 0'], errors='ignore'), None
+    elif text and text.strip():
+        return _text_to_df(text)
+    elif imgs:
+        return _images_to_df(imgs)
+    return None, None
+
+# --- Input widgets (name + 3 input tabs per platform) ---
+col_p1, col_p2 = st.columns(2)
+
+with col_p1:
+    platform1_name = st.text_input("Platform 1 name", value="Platform 1", key="p1name")
+    t1_csv, t1_text, t1_img = st.tabs(["📄 CSV", "📝 Text", "🖼️ Image"])
+    with t1_csv:
+        p1_csv = st.file_uploader("Upload CSV", type=["csv"], key="p1_csv")
+    with t1_text:
+        p1_text = st.text_area(
+            "Paste reviews (one per line)",
+            height=160,
+            placeholder="Great product, fast delivery!\nBattery life could be better.\nExcellent value for money.",
+            key="p1_text"
+        )
+    with t1_img:
+        p1_imgs = st.file_uploader(
+            "Upload review screenshot(s)",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            key="p1_img"
+        )
+
+with col_p2:
+    platform2_name = st.text_input("Platform 2 name", value="Platform 2", key="p2name")
+    t2_csv, t2_text, t2_img = st.tabs(["📄 CSV", "📝 Text", "🖼️ Image"])
+    with t2_csv:
+        p2_csv = st.file_uploader("Upload CSV", type=["csv"], key="p2_csv")
+    with t2_text:
+        p2_text = st.text_area(
+            "Paste reviews (one per line)",
+            height=160,
+            placeholder="Good but overpriced.\nAmazing quality, will buy again!\nTook too long to arrive.",
+            key="p2_text"
+        )
+    with t2_img:
+        p2_imgs = st.file_uploader(
+            "Upload review screenshot(s)",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            key="p2_img"
+        )
+
+# --- Resolve inputs ---
+df_p1_raw, err1 = _resolve_platform_input(p1_csv, p1_text, p1_imgs)
+df_p2_raw, err2 = _resolve_platform_input(p2_csv, p2_text, p2_imgs)
+
+if err1:
+    st.error(f"{platform1_name}: {err1}")
+if err2:
+    st.error(f"{platform2_name}: {err2}")
+
+if df_p1_raw is not None and df_p2_raw is not None:
+    with st.spinner("Analyzing platforms..."):
+        df_p1, err1 = _process_platform_df(df_p1_raw, profile)
+        df_p2, err2 = _process_platform_df(df_p2_raw, profile)
+
+    if err1:
+        st.error(f"{platform1_name}: {err1}")
+    elif err2:
+        st.error(f"{platform2_name}: {err2}")
+    else:
+        st.markdown(f"### {platform1_name} vs {platform2_name} — Sentiment Distribution")
+        col_s1, col_s2 = st.columns(2)
+
+        def _sentiment_bar(df_in, name):
+            counts = df_in['final_sentiment'].value_counts().reset_index()
+            counts.columns = ['Sentiment', 'Count']
+            color_scale = alt.Scale(domain=['Positive', 'Neutral', 'Negative'],
+                                    range=['#21ba45', '#a0a0a0', '#db2828'])
+            return alt.Chart(counts).mark_bar().encode(
+                x=alt.X('Sentiment', sort=['Positive', 'Neutral', 'Negative']),
+                y='Count',
+                color=alt.Color('Sentiment', scale=color_scale),
+                tooltip=['Sentiment', 'Count']
+            ).properties(title=name, width='container', height=300)
+
+        with col_s1:
+            st.altair_chart(_sentiment_bar(df_p1, platform1_name), use_container_width=True)
+        with col_s2:
+            st.altair_chart(_sentiment_bar(df_p2, platform2_name), use_container_width=True)
+
+        st.markdown("### Average Rating")
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            st.metric(f"{platform1_name} Avg Rating", f"{df_p1['Rating'].mean():.2f} / 5")
+        with col_r2:
+            st.metric(f"{platform2_name} Avg Rating", f"{df_p2['Rating'].mean():.2f} / 5")
+
+        st.markdown("### Aspect Positive Sentiment Comparison (%)")
+
+        def _aspect_pos_pct(df_in, prof):
+            rows = []
+            for asp in prof['aspects']:
+                col = asp + '_mention'
+                pos = np.sum((df_in[col]) & (df_in['text_sentiment'] == 'Positive'))
+                total = np.sum(df_in[col])
+                rows.append({'Aspect': prof['aspect_display'].get(asp, asp.title()),
+                              'Positive (%)': round(100 * pos / total, 1) if total else 0})
+            return pd.DataFrame(rows)
+
+        asp_p1 = _aspect_pos_pct(df_p1, profile).rename(columns={'Positive (%)': platform1_name})
+        asp_p2 = _aspect_pos_pct(df_p2, profile).rename(columns={'Positive (%)': platform2_name})
+        asp_merged = asp_p1.merge(asp_p2, on='Aspect')
+        asp_melted = asp_merged.melt(id_vars='Aspect', var_name='Platform', value_name='Positive (%)')
+
+        comparison_chart = alt.Chart(asp_melted).mark_bar().encode(
+            x=alt.X('Aspect', sort='-y'),
+            y=alt.Y('Positive (%)'),
+            color='Platform',
+            xOffset='Platform',
+            tooltip=['Aspect', 'Platform', 'Positive (%)']
+        ).properties(width='container', height=380)
+        st.altair_chart(comparison_chart, use_container_width=True)
+
+        st.dataframe(asp_merged.set_index('Aspect'))
+else:
+    st.info("Provide input for both platforms above to enable comparison.")

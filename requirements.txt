@@ -5,7 +5,8 @@ wordcloud
 altair
 vaderSentiment
 langdetect
-googletrans==4.0.0-rc1
+deep-translator
+anthropic
 clean-text
 bertopic
 sentence-transformers
